@@ -1,0 +1,686 @@
+---
+title: "Spatial and Temporal Analysis of TB in Nam Dinh Using INLA"
+format: html
+---
+
+# Introduction
+
+This document outlines the process of analyzing spatial and temporal data using Integrated Nested Laplace Approximations (INLA) in R. We aim to explore the effects of several predictors on observed outcomes across different spatial and temporal scales.
+
+# Setup
+
+## Load Required Libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+library(sf)
+library(tidyverse)
+library(spdep)
+library(INLA)
+library(ggthemes)
+library(knitr)
+```
+
+```{r load_data, message=FALSE, echo=FALSE}
+gdf <- st_read("merged_df1.geojson")
+gdf$POP_DENS <-gdf$POP_DENS/1000
+gdf$adjusted_observed[gdf$adjusted_observed==0.001] <- 0
+colnames(gdf)[colnames(gdf) == "adjusted_observed"] <- "Y"
+colnames(gdf)[colnames(gdf) == "expected"] <- "E"
+subset_gdf <- gdf[gdf$year == 2020, ]
+#nb <- poly2nb(subset_gdf)
+#nb2INLA("map.adj", nb)
+```
+
+```{r plot_setup, message=FALSE, echo=FALSE}
+theme_Publication <- function(base_size=12) {
+  library(grid)
+  library(ggthemes)
+  (theme_foundation(base_size=base_size)
+    + theme(plot.title = element_text(face = "bold",
+                                      size = rel(1.2), hjust = 0.5),
+            text = element_text(),
+            panel.background = element_rect(colour = NA),
+            plot.background = element_rect(colour = NA),
+            panel.border = element_rect(colour="black", fill=NA, linewidth=0.5),
+            axis.title = element_text(face = "bold",size = rel(1)),
+            axis.title.y = element_text(angle=90,vjust =2),
+            axis.title.x = element_text(vjust = -0.2),
+            axis.text = element_text(), 
+            axis.line = element_line(colour="black"),
+            axis.ticks = element_line(),
+            panel.grid.major = element_line(colour="#f0f0f0"),
+            panel.grid.minor = element_blank(),
+            legend.key = element_rect(colour = NA),
+            plot.margin=unit(c(10,5,5,5),"mm"),
+            strip.background=element_rect(colour="#f0f0f0",fill="#f0f0f0"),
+            strip.text = element_text(face="bold")
+    ))
+  
+}
+
+scale_fill_Publication <- function(...){
+  library(scales)
+  discrete_scale("fill","Publication",manual_pal(values = c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3","#fb9a99","#984ea3","#ffff33")), ...)
+  
+}
+
+scale_colour_Publication <- function(...){
+  library(scales)
+  discrete_scale("colour","Publication",manual_pal(values = c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3","#fb9a99","#984ea3","#ffff33")), ...)
+  
+}
+```
+
+### Calculate TB notifications by time
+
+```{r notif}
+notif_data <- gdf %>%
+  group_by(year) %>%
+  summarise(
+    Total_Observed = sum(Y),
+    Total_Population = sum(pop)  
+  ) %>%
+  mutate(notif = (Total_Observed / Total_Population) * 1e5)
+notif_data
+```
+
+```{r plot_notif}
+ggplot(notif_data, aes(x = year, y = notif)) +
+  geom_line() +
+  geom_point() +
+  theme_Publication() +
+  labs(
+    title = "",
+    x = "Year",
+    y = "TB case notifications per 100,000"
+  )
+```
+
+### Moran's I Calculation
+
+```{r pre_moran}
+weights <- poly2nb(subset_gdf, queen = TRUE)  
+weights <- nb2listw(weights, style = "W", zero.policy = TRUE)
+gdf$Y[gdf$Y==0] <- NA
+gdf$SMR <- gdf$Y / gdf$E
+```
+
+```{r moran}
+unique_years <- unique(gdf$year)
+
+# Initialize an empty list to store results
+moran_results <- list()
+
+# Loop through each year and calculate Moran's I
+for (current_year in unique_years) {
+  # Subset data for the specific year
+  year_data <- dplyr::filter(gdf, year == current_year)
+
+  # Check if year_data is empty after subsetting
+  if (nrow(year_data) == 0) {
+    cat(sprintf("Moran's I for year %d: No data for this year\n", current_year))
+    moran_results[[as.character(current_year)]] <- list(year = current_year, moran = NA, p_value = NA, warning = "No data for this year")
+    next
+  }
+
+  # Convert 'SMR' to numeric
+  year_data$SMR <- as.numeric(as.character(year_data$SMR))
+
+  # Replace NA values in SMR with 0
+  year_data$SMR[is.na(year_data$SMR)] <- 0
+
+  # Ensure the order of SMR values matches the spatial units in the weights matrix
+  if (length(year_data$SMR) != length(weights$neighbours)) {
+    cat(sprintf("Moran's I for year %d: Mismatch in data length and weights matrix\n", current_year))
+    moran_results[[as.character(current_year)]] <- list(year = current_year, moran = NA, p_value = NA, warning = "Mismatch in data length and weights matrix")
+    next
+  }
+
+  # Perform Moran's I test
+  moran_test <- moran.test(year_data$SMR, weights, zero.policy = TRUE)
+  #cat(sprintf("Moran's I for year %d is %f with a normal p-value of %f\n", current_year, moran_test$estimate, moran_test$p.value))
+  
+  # Store results in the list
+  moran_results[[as.character(current_year)]] <- list(year = current_year, moran = moran_test$estimate, p_value = moran_test$p.value)
+}
+
+```
+
+```{r moran_table, warning=FALSE}
+# Assuming moran_results is a list of lists with each year's result
+# Convert the list to a data frame
+results_df <- do.call(rbind, lapply(names(moran_results), function(year) {
+  moran <- moran_results[[year]]$moran
+  data.frame(
+    Year = as.integer(year),
+    Moran_I = moran[1],   # Moran I statistic
+    Expectation = moran[2],  # Expected value
+    Variance = moran[3],  # Variance of Moran's I
+    P_Value = moran_results[[year]]$p_value
+  )
+}))
+
+### 2. Presenting the Data
+
+# Use kable from knitr to create a nice table
+knitr::kable(results_df, format = "html", table.attr = "style='width:100%;'", 
+             col.names = c("Year", "Moran I", "Expectation", "Variance", "P-Value"))
+
+```
+
+```{r}
+gdf$year <- as.integer(gdf$year)
+
+data1 <- gdf %>%
+  mutate(SMR = ifelse(is.na(SMR), 0, SMR)) %>%  # Replace NA values with 0
+  group_by(year) %>%
+  do({
+    .data <- .
+    local_moran_results <- localmoran(.data$SMR, weights)
+    # Transform results into a dataframe to rejoin with original data
+    data.frame(.data, 
+               local_I = local_moran_results[, "Ii"],
+               p_value = 2 * pnorm(-abs(local_moran_results[, "Z.Ii"]), lower.tail = TRUE),  # two-sided p-value
+               hotspot_type = attr(local_moran_results, "quadr")[["pysal"]]  # assuming 'pysal' gives the most consistent results
+    )
+  }) %>%
+  ungroup()
+```
+
+```{r}
+# Visualization using ggplot2 with facets for each year
+merged_data <- gdf %>%
+  # Step 1: Remove the 'observed' column from gdf before merging
+  select(-observed, -hotspot_type) %>%
+  # Step 2: Merge with selected columns from data1
+  left_join(data1 %>%
+            select(OBJECTID, year, observed, SMR, hotspot_type),
+            by = c("OBJECTID", "year"))
+
+```
+
+```{r}
+merged_data$hotspot_type <- factor(merged_data$hotspot_type, 
+                                   levels = c("High-High", "High-Low", "Low-High", "Low-Low", "Not significant"))
+
+lisa_plot <- ggplot(data = merged_data) +
+  geom_sf(aes(fill = hotspot_type), color = "black") +  # Fill regions based on hotspot type and set borders to black
+  scale_fill_manual(values = c("High-High" = "red", "Low-Low" = "blue",
+                               "High-Low" = "pink", "Low-High" = "green",
+                               "Not significant" = "grey")) +  # Define manual color for each hotspot type
+  facet_wrap(~ year, ncol = 2) +  # Facet by 'year', with two columns
+  labs(title = "",
+       fill = "Hotspot Type") +
+ theme_Publication() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_blank(), axis.line = element_blank(),
+        strip.background = element_blank(),  # Remove facet label backgrounds
+        strip.text = element_text(color = "black", size = 12),  # Style facet labels
+        axis.text.x = element_blank(),  # Remove x-axis labels
+        axis.text.y = element_blank(),  # Remove y-axis labels
+        axis.ticks = element_blank(),  # Remove axis ticks
+        legend.title = element_blank(),
+        legend.position = "right",  # Set legend position to top right
+        legend.justification = "top",
+        legend.text = element_text(size = 8),  # Smaller legend text
+        legend.key.size = unit(0.5, "cm"),
+        plot.margin = grid::unit(c(0,0,0,0), "mm"))  # Justify the 
+lisa_plot
+
+```
+
+```{r}
+merged_data <- merged_data %>%
+  mutate(
+    observed_category = cut(observed,
+                            breaks = c(0, 5, 10, Inf),
+                            labels = c("0-5", "6-10", "11+"),
+                            right = TRUE)  # intervals are closed on the right
+  )
+
+# Create a spatial plot with faceting by year, arranged in two columns
+oplot <- ggplot(data = merged_data) +
+  geom_sf(aes(fill = observed_category), color = "black") +  # Fill regions based on observed category
+  scale_fill_manual(values = c("0-5" = "blue", "6-10" = "orange", "11+" = "red"),  # Custom colors
+                    name = "Observed Cases",  # Rename legend title
+                    guide = guide_legend(title.position = "top")) +
+  facet_wrap(~ year, ncol = 2) +  # Facet by 'year', with two columns
+  labs(title = "") +
+  theme_Publication() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_blank(), axis.line = element_blank(),
+        strip.background = element_blank(),  # Remove facet label backgrounds
+        strip.text = element_text(color = "black", size = 12),  # Style facet labels
+        axis.text.x = element_blank(),  # Remove x-axis labels
+        axis.text.y = element_blank(),  # Remove y-axis labels
+        axis.ticks = element_blank(),  # Remove axis ticks
+        legend.title = element_blank(),
+        legend.position = "right",  # Set legend position to top right
+        legend.justification = "top",
+        legend.text = element_text(size = 8),  # Smaller legend text
+        legend.key.size = unit(0.5, "cm"),
+        plot.margin = grid::unit(c(0,0,0,0), "mm")) 
+oplot
+```
+
+# Bayesian spatio-temporal modelling
+
+```{r create_graph}
+#creat graph
+nb <- poly2nb(subset_gdf)
+nb2INLA("map.adj", nb)
+#create id coulmn for each model
+gdf$idarea <- as.numeric(as.factor(gdf$OBJECTID))
+gdf$idarea1 <- gdf$idarea
+gdf$year = as.integer(gdf$year)
+gdf$idtime <- 1 + gdf$year - min(gdf$year)
+gdf$idtime1 <-gdf$idtime
+g <- inla.read.graph(filename = "map.adj")
+gdf <- gdf %>%
+  mutate(id2 = row_number())
+gdf$idarea.int <- gdf$idarea
+gdf$idyear.int <- gdf$idtime
+```
+
+## BYMn model (Model 1a)
+
+```{r m1a}
+formula1a<-Y~1+f(idarea1, model="bym",graph=g)
+result1a<-inla(formula1a,family="poisson",data=gdf,
+              E=E,control.predictor = list(compute = TRUE),
+              control.compute=list(dic=TRUE,cpo=TRUE,waic=TRUE))
+summary(result1a)
+```
+
+## BYM with covariates (Model 1b)
+
+```{r m1b}
+formula1b<-Y~1+f(idarea1,model="bym",graph=g) + poor + POP_DENS
+result1b<-inla(formula1b,family="poisson",data=gdf,
+              E=E,control.compute=list(dic=TRUE,cpo=TRUE,waic=TRUE))
+summary(result1b)
+```
+
+## BYM + temporal random walk 2 (Model 2a)
+
+```{r m2a}
+formula2a<-Y~1+f(idarea1, model="bym",graph=g) + f(idtime,model="rw2")
+result2a<-inla(formula2a,family="poisson",data=gdf,
+              E=E,control.compute=list(dic=TRUE,cpo=TRUE,waic=TRUE))
+summary(result2a)
+```
+
+## BYM + temporal random walk 2 + covariates (2b)
+
+```{r m2b}
+formula2b<-Y~1+f(idarea1, model="bym",graph=g) + f(idtime,model="rw2") + poor + POP_DENS
+result2b<-inla(formula2b,family="poisson",data=gdf,
+              E=E,control.compute=list(dic=TRUE,cpo=TRUE,waic=TRUE))
+summary(result2b)
+```
+
+## BYM + temporal random walk 2 + Space-time interaction Type I (Model 3a)
+
+```{r m3a}
+formula3a<-Y~1+f(idarea1,model="bym",graph=g)+ f(idtime,model="rw2")+f(id2,model="iid")
+result3a<-inla(formula3a,family="poisson",data=gdf,
+              E=E,control.compute=list(dic=TRUE,cpo=TRUE,waic=TRUE))
+summary(result3a)
+```
+
+## BYM + temporal random walk 2 + Space-time interaction Type I + covariates (Model 3b)
+
+```{r m3b}
+formula3b<-Y~1+f(idarea1,model="bym",graph=g)+ f(idtime,model="rw2")+f(id2,model="iid") + poor + POP_DENS
+result3b<-inla(formula3b,family="poisson",data=gdf,
+              E=E,control.compute=list(dic=TRUE,cpo=TRUE,waic=TRUE))
+summary(result3b)
+```
+
+## BYM + temporal random walk 2+ Space-time interaction Type II (Model 4a)
+
+```{r m4a}
+formula4a<- Y ~ f(idarea,model="bym",graph=g) +
+  f(idtime,model="rw2") +
+  f(idtime1,model="iid") +
+  f(idarea.int,model="iid", group=idyear.int,
+    control.group=list(model="rw2"))
+
+result4a <- inla(formula4a,family="poisson",data=gdf,E=E,
+                 control.predictor=list(compute=TRUE),
+                 control.compute=list(dic=TRUE,cpo=TRUE, waic=TRUE))
+summary(result4a)
+```
+
+## BYM + temporal random walk 2 + Space-time interaction Type II + covariates (Model 4b)
+
+```{r m4b}
+formula4b<- Y ~ f(idarea,model="bym",graph=g) +
+  f(idtime,model="rw2") +
+  f(idtime1,model="iid") +
+  f(idarea.int,model="iid", group=idyear.int,
+    control.group=list(model="rw2")) + + poor + POP_DENS
+
+result4b <- inla(formula4b,family="poisson",data=gdf,E=E,
+                 control.predictor=list(compute=TRUE),
+                 control.compute=list(dic=TRUE,cpo=TRUE, waic=TRUE))
+summary(result4b)
+```
+
+## BYM + temporal random walk 2 + Space-time interaction type III (Model 5a)
+
+```{r m5a}
+formula5a<- Y ~ f(idarea,model="bym",graph=g) +
+  f(idtime,model="rw2") +
+  f(idtime1,model="iid") +
+  f(idyear.int,model="iid", group=idarea.int,
+    control.group=list(model="besag",
+                       graph=g))
+result5a <- inla(formula5a,family="poisson",data=gdf,E=E,
+                  control.predictor=list(compute=TRUE),
+                  control.compute=list(dic=TRUE,cpo=TRUE, waic=TRUE))
+summary(result5a)
+```
+
+## BYM + temporal random walk 2 + Space-time interaction type III + covariates (Model 4b)
+
+```{r m5b}
+formula5b<- Y ~ f(idarea,model="bym",graph=g) +
+  f(idtime,model="rw2") +
+  f(idtime1,model="iid") +
+  f(idyear.int,model="iid", group=idarea.int,
+    control.group=list(model="besag",
+                       graph=g)) + poor + POP_DENS
+result5b <- inla(formula5b,family="poisson",data=gdf,E=E,
+                  control.predictor=list(compute=TRUE),
+                  control.compute=list(dic=TRUE,cpo=TRUE, waic=TRUE))
+summary(result5b)
+```
+
+## Comparing performance of models
+
+Now we compare performance of models (<https://www.sciencedirect.com/science/article/pii/S2211675324000344>)
+
+```{r comparing}
+# Function to apply INLA group cross-validation
+apply_inla_group_cv <- function(result) {
+  result$loocv <- inla.group.cv(result, num.level.sets = -1)
+  result$logcv.m3 <- inla.group.cv(result, num.level.sets = 3)
+  result$logcv.m5 <- inla.group.cv(result, num.level.sets = 5)
+  result$logcv.m10 <- inla.group.cv(result, num.level.sets = 10)
+  return(result)
+}
+
+# Function to process model results and extract metrics
+process_model_results <- function(results) {
+  
+  # Define functions for extracting metrics like DIC and WAIC
+  DIC <- function(x) {
+    data.frame(mean.deviance = x$dic$mean.deviance,
+               p.eff.DIC = x$dic$p.eff,
+               DIC = x$dic$dic,
+               WAIC = x$waic$waic,
+               p.WAIC = x$waic$p.eff)
+  }
+  
+  # Function to compute LOOCV
+  compute_loocv <- function(x) {
+    cv_values <- x$loocv$cv
+    cv_values <- cv_values[!is.na(cv_values)]  # Remove NA values
+    if (length(cv_values) > 0) {
+      -mean(log(cv_values))
+    } else {
+      NA
+    }
+  }
+  
+  # Helper function to compute log cross-validation metrics
+  logcv <- function(cv_values) {
+    cv_values <- cv_values[!is.na(cv_values)]  # Remove NA values
+    if (length(cv_values) > 0) {
+      -mean(log(cv_values))
+    } else {
+      NA  # Handle cases where all values are NA
+    }
+  }
+  
+  # Function to compute logcv metrics for different sets (m3, m5, m10)
+  compute_logcv <- function(x) {
+    logcv_rounded <- function(cv_values) {
+      value <- logcv(cv_values)
+      if (!is.na(value)) round(value, 3) else NA
+    }
+    
+    list(
+      logcv_m3 = logcv_rounded(x$logcv.m3$cv),
+      logcv_m5 = logcv_rounded(x$logcv.m5$cv),
+      logcv_m10 = logcv_rounded(x$logcv.m10$cv)
+    )
+  }
+  
+  tables <- list()  # List to store the tables
+  
+  # Loop through each model result and compute metrics
+  for (name in names(results)) {
+    result <- results[[name]]
+    
+    # Extract DIC and WAIC
+    dic_waic <- DIC(result)
+    
+    # Compute LOOCV
+    loocv <- round(compute_loocv(result), 3)
+    
+    # Compute logcv metrics
+    logcv_results <- compute_logcv(result)
+    
+    # Combine all data into a single table
+    table <- data.frame(
+      mean.deviance = dic_waic$mean.deviance,
+      DIC = dic_waic$DIC,
+      p.DIC = dic_waic$p.eff.DIC,
+      WAIC = dic_waic$WAIC,
+      p.WAIC = dic_waic$p.WAIC,
+      LOOCV = loocv,
+      logcv_m3 = I(list(logcv_results$logcv_m3)),
+      logcv_m5 = I(list(logcv_results$logcv_m5)),
+      logcv_m10 = I(list(logcv_results$logcv_m10))
+    )
+    
+    tables[[name]] <- table  # Store the table for each model
+  }
+  
+  # Combine all tables into a single data frame
+  final_table <- do.call(rbind, tables)
+  
+  # Return the final table as HTML format with a caption
+  return(kable(final_table, format = "html", caption = "Model Evaluation Results"))
+}
+
+# Example usage: Create a list of model results
+results <- list(result1a, result1b, result2a, result2b, result3a, result3b, result4a, result4b, result5a, result5b)
+
+# Apply cross-validation to all models
+results <- lapply(results, apply_inla_group_cv)
+
+# Name the models for better identification in the output
+names(results) <- c("Model 1a", "Model 1b", "Model 2a", "Model 2b", "Model 3a", "Model 3b", "Model 4a", "Model 4b", "Model 5a", "Model 5b")
+
+# Process the results and generate the final table
+final_table <- process_model_results(results)
+```
+
+```{r plot_final_table}
+final_table
+```
+
+### Analyzing M3b - best fitted
+
+```{r m3b_fixed}
+result3b$summary.fixed
+```
+
+```{r}
+result3b$summary.hyperpar
+```
+
+```{r}
+summary(result3b$cpo$cpo - result3a$cpo$cpo)
+```
+
+```{r}
+plot(result3b$cpo$cpo, result3a$cpo$cpo, xlab = "Model 3 CPO", ylab = "Model 2 CPO", main = "CPO Comparison")
+abline(a = 0, b = 1, col = "red")
+```
+
+## Sensitivity analysis
+
+Different configs of hyperparameters will be tested with Model 4a.
+
+```{r}
+formula3b_s2 <- Y ~ 1 + 
+  f(idarea1, model = "bym", graph = g, hyper = list(
+    prec.unstruct = list(prior = "loggamma", param = c(0.01, 0.01)),
+    prec.spatial = list(prior = "loggamma", param = c(0.01, 0.01))
+  )) +
+  f(idtime, model = "rw2", hyper = list(
+    prec = list(prior = "pc.prec", param = c(0.01, 0.01))
+  )) +
+  f(id2, model = "iid", hyper = list(
+    prec = list(prior = "loggamma", param = c(0.01, 0.01))
+  )) + 
+  poor + POP_DENS
+result3b_s2 <- inla(formula3b_s2, family = "poisson", data = gdf, E = E, control.predictor = list(compute = TRUE), control.compute=list(dic=TRUE,cpo=TRUE,waic=TRUE, return.marginals.predictor=TRUE) ) 
+summary(result3b_s2)
+```
+
+```{r}
+formula3b_s3 <- Y ~ 1 + 
+  f(idarea1, model = "bym", graph = g, hyper = list(
+    prec.unstruct = list(prior = "loggamma", param = c(2, 0.5)),
+    prec.spatial = list(prior = "loggamma", param = c(2, 0.5))
+  )) +
+  f(idtime, model = "rw2", hyper = list(
+    prec = list(prior = "pc.prec", param = c(2, 0.5))
+  )) +
+  f(id2, model = "iid", hyper = list(
+    prec = list(prior = "loggamma", param = c(2, 0.5))
+  )) + 
+  poor + POP_DENS
+result3b_s3 <- inla(formula3b_s3, family = "poisson", data = gdf, E = E, control.predictor = list(compute = TRUE), control.compute=list(dic=TRUE,cpo=TRUE,waic=TRUE, return.marginals.predictor=TRUE) ) 
+summary(result3b_s3)
+```
+
+## Marginal posterior distribution
+
+```{r}
+plot_combined_marginal_effects_with_quantiles <- function(result_list, effect_name, model_names) {
+  # Create an empty data frame to store combined data
+  combined_data <- data.frame(x = numeric(), y = numeric(), Model = factor(), lquant = numeric(), uquant = numeric())
+  
+  # Loop through the list of model results
+  for (i in seq_along(result_list)) {
+    # Extract the marginal effects for the specified variable
+    effect <- result_list[[i]]$marginals.fixed[[effect_name]]
+    
+    # Calculate the quantiles for the shading
+    lquant <- inla.qmarginal(0.025, effect)
+    uquant <- inla.qmarginal(0.975, effect)
+    
+    # Create a data frame from the smoothed marginal
+    df_effect <- data.frame(inla.smarginal(effect))
+    df_effect$Model <- model_names[i]
+    df_effect$lquant <- lquant
+    df_effect$uquant <- uquant
+    
+    # Combine with the main data frame
+    combined_data <- rbind(combined_data, df_effect)
+  }
+  
+  # Ensure the 'Model' factor is ordered as desired for the legend
+  combined_data$Model <- factor(combined_data$Model, levels = model_names)
+  
+  # Define line types and widths for better differentiation
+  line_types <- c("solid", "dashed", "dotdash", "longdash")
+  
+  # Generate the plot
+  p <- ggplot(combined_data, aes(x, y, color = Model)) +
+    geom_line(aes(linetype = Model), size = 1.0) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+     scale_colour_manual(values = c("#386cb0", "#fdb462", "#7fc97f")) +
+    scale_linetype_manual(values = line_types) +
+    theme_Publication(base_size = 12) +
+    theme(legend.position = "bottom", legend.title = element_blank(), legend.text = element_text(size = 8)) +
+    labs(title = "",
+         x = NULL, y = "Probability density")
+  
+  return(p)
+}
+
+# Usage
+result_list <- list(result3b, result3b_s2, result3b_s3)
+model_names <- c("Default priors", "Best-fitted, log-gamma (0.01, 0.01)", "log-gamma (2, 0.5)")
+plot <- plot_combined_marginal_effects_with_quantiles(result_list, "poor", model_names)
+print(plot)
+```
+
+```{r}
+resultS_sensitivity <- list(result3b, result3b_s2, result3b_s3)
+names(resultS_sensitivity) <- c("Model 3b", "Model 3b (0.01, 0.01)", "Model 3b (2, 0.5)")
+sensitivity_table <- process_model_results(resultS_sensitivity)
+sensitivity_table
+```
+
+```{r}
+combined_data <- data.frame(
+  Metrics = c(
+    "D̄", "ρ_D", "DIC", "WAIC", "LOOCV", 
+    "Poor household percentages Mean (SD)", "Poor household percentages Median (95% CrI)",
+    "Population density Mean (SD)", "Population density Median (95% CrI)"
+  ),
+  `Model 3b (α = 1, κ = 0.0005)` = c(
+    10264.67, 380.0153, 10644.68, 10660.90, 2.391, 
+    "0.013 (0.005)", "0.013 (0.001 - 0.025)", 
+    "0.001 (0.005)", "0.01 (-0.009 - 0.010)"
+  ),
+  `Model 3b (α = 0.01, κ = 0.01)` = c(
+    10244.56, 399.0378, 10643.59, 10655.67, 2.391, 
+    "0.012 (0.007)", "0.013 (0.001 - 0.025)", 
+    "0.001 (0.005)", "0.001 (-0.009 - 0.010)"
+  ),
+  `Model 3b (α = 2, κ = 0.5)` = c(
+    10136.64, 522.1354, 10658.78, 10638.51, 2.393, 
+    "0.014 (0.007)", "0.012 (0.001 - 0.025)", 
+    "-0.002 (0.005)", "-0.002 (-0.011 - 0.002)"
+  )
+)
+
+# Print the final table
+kable(combined_data, format = "html", caption = "Combined Table: Sensitivity Analysis and Fixed Effects of Model 3b")
+```
+
+```{r}
+rrplot = ggplot(data = gdf1) +
+  geom_sf(aes(fill = RR), color = "black") +  # Fill regions based on RR values
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red",  # Gradient colors
+    name = "Relative Risk",  # Rename legend title
+    guide = guide_colorbar(title.position = "top")
+  ) +
+  facet_wrap(~ year, ncol = 2) +  # Facet by 'year', with two columns
+  labs(title = "") +
+  theme_Publication() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank(), 
+        axis.line = element_blank(),
+        strip.background = element_blank(),  # Remove facet label backgrounds
+        strip.text = element_text(color = "black", size = 12),  # Style facet labels
+        axis.text.x = element_blank(),  # Remove x-axis labels
+        axis.text.y = element_blank(),  # Remove y-axis labels
+        axis.ticks = element_blank(),  # Remove axis ticks
+        legend.title = element_blank(),
+        legend.position = "right",  # Set legend position to top right
+        legend.justification = "top",
+        legend.text = element_text(size = 8),  # Smaller legend text
+        legend.key.size = unit(0.5, "cm"),
+        plot.margin = grid::unit(c(0,0,0,0), "mm"))
+
+```
